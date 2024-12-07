@@ -1,19 +1,31 @@
-use std::path::PathBuf;
-use clap::{Parser, Subcommand};
 use chrono::Local;
-use log::{debug, info, warn, error};
-use fern::{Dispatch, colors::{Color, ColoredLevelConfig}};
+use clap::{Parser, Subcommand};
+use fern::{
+    colors::{Color, ColoredLevelConfig},
+    Dispatch,
+};
+use figment::value::Value;
+use figment::{
+    providers::{Format, Toml},
+    Figment, Provider,
+};
+use log::{debug, error, info};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
 #[command(version, author, about)]
 struct Cli {
+    /// The debug level to use, default is 0, meaning errors only. Max is 3
     #[arg(short, long, default_value = "0")]
     debug: u8,
 
+    /// The configuration file to use, if any. Uses HANGMAN_CONFIG by default, if not provided uses ~/.config/hangman.toml
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     subcommands: Commands,
-
-    //TODO: Add a config file
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -61,6 +73,74 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Config {
+    wordlist: Option<PathBuf>,
+    savefile: Option<PathBuf>,
+    logfile: Option<PathBuf>,
+    debug: u8,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let (savefile, logfile) = if cfg!(windows) {
+            (
+                PathBuf::from(format!(
+                    r#"{}\.hangman-internal-savefile.toml"#,
+                    std::env::var("HOMEPATH").unwrap()
+                )),
+                PathBuf::from(format!(
+                    r#"{}\.hangman.log"#,
+                    std::env::var("HOMEPATH").unwrap()
+                )),
+            )
+        } else {
+            (
+                PathBuf::from("~/.config/hangman_current_game.toml"),
+                PathBuf::from("~/.config/hangman.log"),
+            )
+        };
+        Config {
+            wordlist: None,
+            savefile: Some(savefile),
+            logfile: Some(logfile),
+            debug: 0,
+        }
+    }
+}
+
+impl Provider for Config {
+    fn metadata(&self) -> figment::Metadata {
+        figment::Metadata::named("Default config")
+    }
+
+    fn data(
+        &self,
+    ) -> Result<figment::value::Map<figment::Profile, figment::value::Dict>, figment::Error> {
+        let wordlist_conv = match &self.wordlist {
+            None => "None",
+            Some(pathbuf) => pathbuf.to_str().unwrap(),
+        };
+        let savefile_conv = match &self.savefile {
+            None => "None",
+            Some(pathbuf) => pathbuf.to_str().unwrap(),
+        };
+        let logfile_conv = match &self.logfile {
+            None => "None",
+            Some(pathbuf) => pathbuf.to_str().unwrap(),
+        };
+        let mut dict = figment::value::Dict::new();
+        dict.insert("wordlist".to_string(), Value::from(wordlist_conv));
+        dict.insert("savefile".to_string(), Value::from(savefile_conv));
+        dict.insert("logfile".to_string(), Value::from(logfile_conv));
+        dict.insert("debug".to_string(), Value::from(self.debug));
+        Ok(figment::value::Map::from([(
+            figment::Profile::Default,
+            dict,
+        )]))
+    }
+}
+
 fn handle_guess(guess: String) {
     println!("Guessing: {}", guess);
 }
@@ -97,6 +177,7 @@ fn handle_completions(directory: Option<PathBuf>) {
         None => println!("Generating completions for current directory"),
     }
 }
+
 fn init_logger(debug: u8) -> Result<(), fern::InitError> {
     let level = match debug {
         0 => log::LevelFilter::Error,
@@ -128,23 +209,96 @@ fn init_logger(debug: u8) -> Result<(), fern::InitError> {
     Ok(())
 }
 
+fn verify_toml_file(file: &PathBuf) -> bool {
+    file.is_file() && file.exists() && file.extension() == Some("toml".as_ref())
+}
+
 fn main() {
     let cli = Cli::parse();
-    
+
+    // Load configuration file if provided
+    let mut using_default_config = false;
+    let mut figment: Figment = Figment::new().merge(Config::default());
+    if let Some(config) = cli.config {
+        // Handle the configuration file
+        debug!("Loading configuration file: {:?}", config);
+        if verify_toml_file(&config) {
+            info!(
+                "Provided configuration file, {} is a valid TOML file",
+                config.to_str().unwrap().to_string()
+            );
+            figment = Figment::new().merge(Toml::file(config));
+        } else {
+            error!(
+                "Configuration file provided is not a valid TOML file, trying HANGMAN_CONFIG next"
+            );
+        }
+    } else {
+        let env_config = std::env::var("HANGMAN_CONFIG");
+        match env_config {
+            Ok(file) => {
+                info!("HANGMAN_CONFIG, {} is set. Validating...", &file);
+                let path = PathBuf::from(file.clone());
+                if verify_toml_file(&path) {
+                    info!("HANGMAN_CONFIG, {} is a valid TOML file", &file);
+                    figment = Figment::new().merge(Toml::file(path));
+                } else {
+                    error!("HANGMAN_CONFIG, {} is not a valid TOML file", file);
+                    error!("Tip! If not using HANGMAN_CONFIG, unset the variable using your shell's `unset` function");
+                    debug!("Using default configuration");
+                    using_default_config = true;
+                }
+            }
+            Err(err) => {
+                info!("HANGMAN_CONFIG is not set. Using default configuration file");
+                debug!("For debug purposes, the OS provided error is: {:?}", err);
+                using_default_config = true;
+            }
+        }
+    }
+    if using_default_config {
+        info!("Loading default internal configuration");
+    }
+
+    // Extract the debug level from the configuration
+    let config: Config = figment.extract().expect("Failed to extract configuration");
+    let debug_level = if cli.debug == 0 { config.debug } else { cli.debug };
+
     // Initialize the logger
-    if let Err(e) = init_logger(cli.debug) {
+    if let Err(e) = init_logger(debug_level) {
         eprintln!("Failed to initialize logger: {:?}", e);
         std::process::exit(1);
     }
     debug!("Successfully initialized logger");
-    
+
     match cli.subcommands {
-        Commands::Guess { guess } => { debug!("Running the handler for guess function"); handle_guess(guess); },
-        Commands::Query { check } => { debug!("Running the handler for query function"); handle_query(check); },
-        Commands::New { file } => { debug!("Running the handler for new function"); handle_new(file); },
-        Commands::Save { file } => { debug!("Running the handler for save function"); handle_save(file); },
-        Commands::Load { file } => { debug!("Running the handler for load function"); handle_load(file); },
-        Commands::Show => { debug!("Running the handler for show function"); handle_show(); }
-        Commands::Completions { directory } => { debug!("Running the handler for completions function"); handle_completions(directory); },
+        Commands::Guess { guess } => {
+            debug!("Running the handler for guess function");
+            handle_guess(guess);
+        }
+        Commands::Query { check } => {
+            debug!("Running the handler for query function");
+            handle_query(check);
+        }
+        Commands::New { file } => {
+            debug!("Running the handler for new function");
+            handle_new(file);
+        }
+        Commands::Save { file } => {
+            debug!("Running the handler for save function");
+            handle_save(file);
+        }
+        Commands::Load { file } => {
+            debug!("Running the handler for load function");
+            handle_load(file);
+        }
+        Commands::Show => {
+            debug!("Running the handler for show function");
+            handle_show();
+        }
+        Commands::Completions { directory } => {
+            debug!("Running the handler for completions function");
+            handle_completions(directory);
+        }
     }
 }

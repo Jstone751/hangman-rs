@@ -298,6 +298,7 @@ dependencies = [
  "fern",
  "figment",
  "log",
+ "serde",
 ]
 
 [[package]]

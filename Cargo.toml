@@ -11,3 +11,4 @@ clap_allgen = "0.2.1"
 fern = { version = "0.7.0", features = ["colored"] }
 figment = { version = "0.10.19", features = ["env", "toml"] }
 log = { version = "0.4.22", features = ["std"] }
+serde = { version = "1.0.215", features = ["derive"] }
